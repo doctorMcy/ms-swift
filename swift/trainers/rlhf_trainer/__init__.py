@@ -8,6 +8,7 @@ if TYPE_CHECKING:
     from .dpo_trainer import DPOTrainer
     from .grpo_trainer import GRPOTrainer
     from .kto_trainer import KTOTrainer
+    from .opd_trainer import OPDTrainer
     from .orpo_trainer import ORPOTrainer
     from .ppo_trainer import PPOTrainer
     from .reward_trainer import RewardTrainer
@@ -21,6 +22,7 @@ else:
         'dpo_trainer': ['DPOTrainer'],
         'grpo_trainer': ['GRPOTrainer'],
         'kto_trainer': ['KTOTrainer'],
+        'opd_trainer': ['OPDTrainer'],
         'orpo_trainer': ['ORPOTrainer'],
         'ppo_trainer': ['PPOTrainer'],
         'reward_trainer': ['RewardTrainer'],

@@ -9,7 +9,7 @@ from swift.utils import get_current_device, get_logger, is_master, is_mp, json_p
 from .train_args import TrainArguments
 
 logger = get_logger()
-rlhf_support_vllm_types = ['grpo', 'gkd']
+rlhf_support_vllm_types = ['grpo', 'gkd', 'opd']
 
 
 @dataclass
@@ -88,7 +88,7 @@ class RLHFArguments(TeacherModelArguments, GRPOArguments, PPOArguments, RewardMo
         desirable_weight (float): Weight for desirable outcomes in KTO. Default is 1.0.
         undesirable_weight (float): Weight for undesirable outcomes in KTO. Default is 1.0.
     """
-    rlhf_type: Literal['dpo', 'orpo', 'simpo', 'kto', 'cpo', 'rm', 'ppo', 'grpo', 'gkd'] = 'dpo'
+    rlhf_type: Literal['dpo', 'orpo', 'simpo', 'kto', 'cpo', 'rm', 'ppo', 'grpo', 'gkd', 'opd'] = 'dpo'
     ref_model: Optional[str] = None
     ref_adapters: List[str] = field(default_factory=list)
     ref_model_type: Optional[str] = field(
@@ -270,7 +270,7 @@ class RLHFArguments(TeacherModelArguments, GRPOArguments, PPOArguments, RewardMo
         self._external_vllm_warning()
 
     def _init_padding_side(self):
-        if self.rlhf_type in {'ppo', 'gkd'}:
+        if self.rlhf_type in {'ppo', 'gkd', 'opd'}:
             self.padding_side = 'left'
             # TODO: streaming, MLLM
 
