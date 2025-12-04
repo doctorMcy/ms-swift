@@ -77,6 +77,7 @@ def get_packed_seq_params(position_ids: torch.Tensor) -> PackedSeqParams:
 
 
 def split_cp_inputs(inputs: torch.Tensor, cu_seqlens: torch.Tensor, dim: int):
+    # TODO: compat bshd
     if dim < 0:
         dim = (dim + inputs.ndim) % inputs.ndim
     new_inputs = []
@@ -110,7 +111,7 @@ def get_batch_on_this_cp_rank(batch: Dict[str, Any]):
     cp_size = mpu.get_context_parallel_world_size()
     if cp_size > 1:
         args = get_args()
-        keys = ['labels', 'attention_mask', 'position_ids', 'loss_scale', 'mtp_labels']
+        keys = ['labels', 'attention_mask', 'position_ids', 'loss_scale']
         if not args.is_multimodal:
             # Multimodal models will handle CP in input_embeds.
             keys.append('input_ids')

@@ -89,12 +89,20 @@ class BaseMegatronTrainer(ABC):
             data_parallel_size = mpu.get_data_parallel_world_size()
             step_batch_size = args.micro_batch_size * data_parallel_size
             num_generations = args.num_generations if args.rlhf_type == 'grpo' else 1
-            if args.train_iters is None and args.max_epochs is not None:
+            if args.save_strategy == 'epoch':
                 if hasattr(train_dataset, '__len__'):
-                    dataset_sample = len(train_dataset) // step_batch_size * step_batch_size
-                    dataset_sample = dataset_sample * num_generations
-                    args.train_iters = dataset_sample * args.max_epochs // args.global_batch_size
+                    dataset_sample = len(train_dataset) // step_batch_size * step_batch_size * num_generations
+                    args.save_interval = dataset_sample // args.global_batch_size
+                    args.eval_interval = args.save_interval
+                    if getattr(args, 'save_retain_interval', None) is not None:
+                        args.save_retain_interval *= args.save_interval
                 else:
+                    raise ValueError('streaming dataset is not supported with `--save_strategy epoch`.')
+            if args.max_epochs is not None:
+                if hasattr(train_dataset, '__len__'):
+                    dataset_sample = len(train_dataset) // step_batch_size * step_batch_size * num_generations
+                    args.train_iters = dataset_sample * args.max_epochs // args.global_batch_size
+                elif args.train_iters is None:
                     raise ValueError(
                         'You are using a streaming training dataset. Please explicitly specify `--train_iters`.')
             if args.eval_iters < 0:
@@ -122,37 +130,27 @@ class BaseMegatronTrainer(ABC):
             initialize.validate_args = origin_validate_args
 
     def new_cyclic_iter(self, iterable):
+        training = self.unwrapped_models[0].training
+        if not training:
+            yield from self._origin_cyclic_iter(iterable)
+            return
+
         args = get_args()
-        i = 0
-        n_batch = 0
+        n_epoch = 0
+        is_finished = False
         while True:
-            training = self.unwrapped_models[0].training
-            if training:
-                logger.info(f'The training of Epoch {i} starts...')
-            if training and args.max_epochs and i >= args.max_epochs - 1:
-                it = iter(iterable)
-                num_microbatches = args.global_batch_size // (args.micro_batch_size * args.data_parallel_size)
-                x = [next(it) for _ in range(num_microbatches - n_batch % num_microbatches)]
-                while True:
-                    try:
-                        next_x = [next(it) for _ in range(num_microbatches)]
-                    except StopIteration:
-                        break
-                    yield from x
-                    x = next_x
-                logger.info(f'Training of {i + 1} epochs has been completed, the training has finished.')
-                if isinstance(x, list) and all(isinstance(item, dict) for item in x):
-                    x[0]['is_finished'] = True
-                elif isinstance(x, list) and all(isinstance(item, list) for item in x):
-                    # grpo
-                    for item in x:
-                        item[0]['is_finished'] = True
-                yield from x
-            else:
-                for x in iterable:
-                    n_batch += 1
-                    yield x
-            i += 1
+            if not is_finished:
+                logger.info(f'The training of Epoch {n_epoch} starts...')
+            for x in iterable:
+                yield x
+            if training and args.max_epochs and n_epoch >= args.max_epochs - 1:
+                is_finished = True
+            n_epoch += 1
+            if is_finished:
+                # streaming
+                # Note that this approach will train for one additional step.
+                logger.info(f'Training of {n_epoch} epochs has been completed, the training has finished.')
+                args.train_iters = args.curr_iteration + 1
 
     def _replace_data_iterator(self, data_iterator, model):
         return data_iterator
@@ -296,7 +294,10 @@ class BaseMegatronTrainer(ABC):
         Returns:
             List of parameter groups.
         """
-
+        if self.args.vit_lr is not None or self.args.aligner_lr is not None:
+            vit_lr = self.args.vit_lr if self.args.vit_lr is not None else self.args.lr
+            aligner_lr = self.args.aligner_lr if self.args.aligner_lr is not None else self.args.lr
+            logger.info(f'vit_lr: {vit_lr}, aligner_lr: {aligner_lr}, llm_lr: {self.args.lr}')
         use_decoupled_learning_rate = decoupled_lr is not None
 
         # Map (wd_mult, lr_mult, is_expert_parallel, is_decoupled_lr) to params.
@@ -919,19 +920,21 @@ class BaseMegatronTrainer(ABC):
 
     def merge_lora_adapters(self, adapter_name='default'):
         """Merge LoRA adapters into base model weights for vLLM inference."""
-        for model in self.unwrapped_models:
-            for module in model.modules():
-                if isinstance(module, LoraParallelLinear):
-                    # Merge all active adapters
-                    module.merge(adapter_names=[adapter_name])
+        with torch.no_grad():
+            for model in self.unwrapped_models:
+                for module in model.modules():
+                    if isinstance(module, LoraParallelLinear):
+                        # Merge all active adapters
+                        module.merge(adapter_names=[adapter_name])
 
     def unmerge_lora_adapters(self):
         """Unmerge LoRA adapters to restore training state."""
-        for model in self.unwrapped_models:
-            for module in model.modules():
-                if isinstance(module, LoraParallelLinear):
-                    # Unmerge to restore separate LoRA weights for training
-                    module.unmerge()
+        with torch.no_grad():
+            for model in self.unwrapped_models:
+                for module in model.modules():
+                    if isinstance(module, LoraParallelLinear):
+                        # Unmerge to restore separate LoRA weights for training
+                        module.unmerge()
 
     def save_checkpoint(self, iteration, *_args, **kwargs):
         args = get_args()
@@ -974,8 +977,9 @@ class BaseMegatronTrainer(ABC):
         args = get_args()
         visual_cls = self.args.megatron_model_meta.visual_cls
         if args.train_type == 'full' and args.is_multimodal and visual_cls is not None:
-            vision_tower = [f'visual.{vit}' for vit in visual_cls._vision_tower]
-            aligner = [f'visual.{aligner}' for aligner in visual_cls._aligner]
+            vision_tower = [f'visual.{vit}' for vit in getattr(visual_cls, '_vision_tower', [])]
+            aligner = [f'visual.{aligner}' for aligner in getattr(visual_cls, '_aligner', [])]
+            generator = [f'visual.{generator}' for generator in getattr(visual_cls, '_generator', [])]
             if args.freeze_llm:
                 args.freeze_parameters.append('language_model')
             if args.freeze_vit:
@@ -984,6 +988,7 @@ class BaseMegatronTrainer(ABC):
                 args.freeze_parameters += aligner
             else:
                 args.trainable_parameters += aligner
+            args.freeze_parameters += generator
             if args.freeze_parameters:
                 logger.info(f'freeze_parameters: {args.freeze_parameters}')
             if args.trainable_parameters:
@@ -1030,27 +1035,16 @@ class BaseMegatronTrainer(ABC):
             num_samples = batch.pop('num_samples')
         args = get_args()
         text_position_ids = batch.pop('text_position_ids', None)
+        batch.pop('attention_mask_2d', None)
         if text_position_ids is None:
             text_position_ids = batch.get('position_ids')
         if args.padding_free and text_position_ids is not None:
             batch['packed_seq_params'] = get_packed_seq_params(text_position_ids)
             batch['packed_seq_params'].num_samples = num_samples
-            if args.mtp_num_layers and batch.get('labels') is not None:
-                cu_seqlens = batch['packed_seq_params'].cu_seqlens_q.clone()
-                mtp_labels = batch['labels'].clone()
-                for _ in range(args.mtp_num_layers):
-                    mtp_labels[:, cu_seqlens[cu_seqlens < mtp_labels.shape[1]]] = -100
-                    cu_seqlens = cu_seqlens + 1
-                batch['mtp_labels'] = mtp_labels
         # slice batch along sequence dimension for context parallelism
         batch = get_batch_on_this_cp_rank(batch)
         return batch
 
     def get_batch(self, data_iterator, vp_stage=None):
         """Generate a batch."""
-        args = get_args()
-        data = next(data_iterator)
-        is_finished = data.pop('is_finished', False)
-        if is_finished:
-            args.train_iters = args.curr_iteration + 1
-        return self._prepare_batch(data, vp_stage)
+        return self._prepare_batch(next(data_iterator), vp_stage)
